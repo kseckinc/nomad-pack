@@ -3,9 +3,11 @@ package filesystem
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
+	"github.com/hashicorp/nomad-pack/internal/pkg/errors"
 	"github.com/hashicorp/nomad-pack/internal/pkg/logging"
 )
 
@@ -14,27 +16,27 @@ func CopyFile(sourcePath, destinationPath string, logger logging.Logger) (err er
 	// Open the source file
 	sourceFile, err := os.Open(sourcePath)
 	if err != nil {
-		logger.Debug(fmt.Sprintf("error opening source file: %s", err))
+		logger.Debug(fmt.Sprintf(errors.ErrOpeningSourceFile.Error()+": %s", err))
 		return
 	}
 
 	// Set up a deferred close handler
 	defer func() {
 		if err = sourceFile.Close(); err != nil {
-			logger.Debug(fmt.Sprintf("error closing source file: %s", err))
+			logger.Debug(fmt.Sprintf(errors.ErrClosingSourceFile.Error()+": %s", err))
 		}
 	}()
 
 	// Open the destination file
 	destinationFile, err := os.Create(destinationPath)
 	if err != nil {
-		logger.Debug(fmt.Sprintf("error opening destination file: %s", err))
+		logger.Debug(fmt.Sprintf(errors.ErrOpeningSourceFile.Error()+": %s", err))
 		return
 	}
 	// Set up a deferred close handler
 	defer func() {
 		if err = destinationFile.Close(); err != nil {
-			logger.Debug(fmt.Sprintf("error closing destination file: %s", err))
+			logger.Debug(fmt.Sprintf(errors.ErrClosingSourceFile.Error()+": %s", err))
 		}
 	}()
 
@@ -145,4 +147,94 @@ func CopyDir(sourceDir string, destinationDir string, logger logging.Logger) (er
 	}
 
 	return nil
+}
+
+// IsDir returns true if the given path is an existing directory.
+func IsDir(path string, emptyPathIsValid bool) bool {
+	if path == "" {
+		return emptyPathIsValid
+	}
+
+	if pathAbs, err := filepath.Abs(path); err == nil {
+		if fileInfo, err := os.Stat(pathAbs); !errors.Is(err, os.ErrNotExist) && fileInfo.IsDir() {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Exists returns true if the given path is has a `os.Stat`-able object.
+func Exists(path string, emptyPathIsValid bool) bool {
+	if path == "" {
+		return emptyPathIsValid
+	}
+
+	if pathAbs, err := filepath.Abs(path); err == nil {
+		if _, err := os.Stat(pathAbs); errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// This WriteFile implementation will check to see if the file exists before
+// trying to overwrite it.
+func WriteFile(destination string, content string, overwrite bool) error {
+	// Check to see if the file already exists and validate against the value
+	// of overwrite.
+
+	info, err := os.Stat(destination)
+	pathErr := os.PathError{
+		Op:   "writefile",
+		Path: destination,
+	}
+
+	if err == nil && !overwrite {
+		pathErr.Err = fs.ErrExist
+		return &pathErr
+	}
+	if info != nil && info.IsDir() {
+		pathErr.Err = fmt.Errorf("destination is a directory")
+		return &pathErr
+	}
+
+	err = os.WriteFile(destination, []byte(content), 0644)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CreatePath creates a nested directory if it does not exist. The behavior
+// can be toggled to emit an error when the directory already exists.
+func CreatePath(path string, errIfExists bool) error {
+	// Check to see if the file already exists and handle errIfExists.
+	info, err := os.Stat(path)
+	if err == nil && info.IsDir() && errIfExists {
+		return &ErrDirExists{
+			Op:   "mkdir",
+			Path: path,
+			Err:  fmt.Errorf("directory already exists"),
+		}
+	}
+
+	return os.MkdirAll(path, 0755)
+}
+
+type ErrDirExists struct {
+	Op   string
+	Path string
+	Err  error
+}
+
+func (ede ErrDirExists) Is(target error) bool {
+	return target == fs.ErrExist
+}
+
+func (ede ErrDirExists) Error() string {
+	return fmt.Sprintf("%s %s: %w", ede.Op, ede.Path, ede.Err)
 }

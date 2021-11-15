@@ -1,11 +1,7 @@
 package cli
 
 import (
-	"context"
-	stdErrors "errors"
-	"fmt"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -14,6 +10,7 @@ import (
 	"github.com/hashicorp/nomad-pack/flag"
 	"github.com/hashicorp/nomad-pack/internal/pkg/cache"
 	"github.com/hashicorp/nomad-pack/internal/pkg/errors"
+	"github.com/hashicorp/nomad-pack/internal/pkg/helper/filesystem"
 	"github.com/hashicorp/nomad-pack/terminal"
 	"github.com/posener/complete"
 )
@@ -30,128 +27,6 @@ type RenderCommand struct {
 	// renderToDir is the path to write rendered job files to in addition to
 	// standard output.
 	renderToDir string
-}
-
-type Render struct {
-	Name    string
-	Content string
-}
-
-func (r Render) toTerminal(c *RenderCommand) {
-	c.ui.Output(r.Name+":", terminal.WithStyle(terminal.BoldStyle))
-	c.ui.Output("")
-	c.ui.Output(r.Content)
-}
-
-func (r Render) toFile(c *RenderCommand, ec *errors.UIErrorContext) error {
-	renderToDir := path.Clean(c.renderToDir)
-	err := validateOutDir(renderToDir)
-	if err != nil {
-		ec.Add("Destination Dir: ", renderToDir)
-		return err
-	}
-
-	filePath, fileName := path.Split(r.Name)
-	outDir := path.Join(renderToDir, filePath)
-	outFile := path.Join(outDir, fileName)
-
-	maybeCreateDestinationDir(outDir)
-
-	var overwrite bool
-
-	if !c.autoApproved && c.ui.Interactive() {
-		overwrite, err = confirmOverwrite(c)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = writeFile(outFile, r.Content, c.autoApproved || overwrite)
-	if err != nil {
-		ec.Add("Destination File: ", outFile)
-		return err
-	}
-
-	return nil
-}
-
-func confirmOverwrite(c *RenderCommand) (bool, error) {
-	for {
-		overwrite, err := c.ui.Input(&terminal.Input{
-			Prompt: "Output file exists, overwrite? [y/n] ",
-			Style:  terminal.WarningBoldStyle,
-		})
-		if err != nil {
-			return false, err
-		}
-		overwrite = strings.ToLower(overwrite)
-		if overwrite == "y" || overwrite == "n" {
-			return overwrite == "y", nil
-		}
-	}
-
-}
-
-func validateOutDir(path string) error {
-	if path == "" {
-		return nil
-	}
-	info, err := os.Stat(path)
-
-	if err != nil {
-		if stdErrors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-
-		return fmt.Errorf("unexpected error testing --to-dir path: %w", err)
-	}
-
-	if !info.IsDir() {
-		return stdErrors.New("--to-dir must be a directory")
-	}
-
-	return nil
-}
-
-func maybeCreateDestinationDir(path string) error {
-	_, err := os.Stat(path)
-
-	// If the directory doesn't exist, create it.
-	if stdErrors.Is(err, fs.ErrNotExist) {
-		err := os.MkdirAll(path, 0755)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func writeFile(path string, content string, overwrite bool) error {
-	// Check to see if the file already exists and validate against the value
-	// of overwrite.
-
-	_, err := os.Stat(path)
-
-	if err == nil && !overwrite {
-		return fmt.Errorf("destination file exists and overwrite is unset")
-	}
-
-	err = ioutil.WriteFile(path, []byte(content), 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write rendered template to file: %s", err)
-	}
-
-	return nil
-}
-
-// formatRenderName trims the low-value elements from the rendered template
-// name.
-func formatRenderName(name string) string {
-	outName := strings.Replace(name, "/templates/", "/", 1)
-	outName = strings.TrimRight(outName, ".tpl")
-
-	return outName
 }
 
 // Run satisfies the Run function of the cli.Command interface.
@@ -183,13 +58,14 @@ func (c *RenderCommand) Run(args []string) int {
 		c.ui.ErrorWithContext(err, "failed to initialize client", errorContext.GetAll()...)
 		return 1
 	}
-	err = validateOutDir(c.renderToDir)
-	if err != nil {
-		c.ui.Error(err.Error())
+
+	// fast failure start around aiming to-dir at a file rather than a directory
+	if filesystem.Exists(c.packConfig.Path, true) && !filesystem.IsDir(c.packConfig.Path, true) {
+		err = errors.New("output path exists and is not a directory")
+		c.ui.ErrorWithContext(err, "failed to create output directory", errorContext.GetAll()...)
 		return 1
 	}
 	packManager := generatePackManager(c.baseCommand, client, c.packConfig)
-
 	renderOutput, err := renderPack(packManager, c.baseCommand.ui, errorContext)
 	if err != nil {
 		return 1
@@ -209,10 +85,10 @@ func (c *RenderCommand) Run(args []string) int {
 	// partial output and then erroring out.
 
 	for name, renderedFile := range renderOutput.DependentRenders() {
-		renders = append(renders, Render{Name: formatRenderName(name), Content: renderedFile})
+		renders = append(renders, Render{Name: formatRenderName(name), Content: renderedFile, c: c, ec: errorContext})
 	}
 	for name, renderedFile := range renderOutput.ParentRenders() {
-		renders = append(renders, Render{Name: formatRenderName(name), Content: renderedFile})
+		renders = append(renders, Render{Name: formatRenderName(name), Content: renderedFile, c: c, ec: errorContext})
 	}
 
 	// If the user wants to render and display the outputs template file then
@@ -225,24 +101,16 @@ func (c *RenderCommand) Run(args []string) int {
 		if err != nil {
 			c.ui.ErrorWithContext(err, "failed to render output template", errorContext.GetAll()...)
 		} else {
-			renders = append(renders, Render{Name: "outputs.tpl", Content: outputRender})
+			renders = append(renders, Render{Name: "outputs.tpl", Content: outputRender, c: c, ec: errorContext})
 		}
 	}
 
 	// Output the renders. Output the files first if enabled so that any renders
 	// that display will also have been written to disk.
 	for _, render := range renders {
-		if c.renderToDir != "" {
-			err = render.toFile(c, errorContext)
-			if err != nil {
-				if stdErrors.Is(err, context.Canceled) {
-					return 1
-				}
-				c.ui.ErrorWithContext(err, "failed to render to file", errorContext.GetAll()...)
-				return 1
-			}
+		if err, ec := render.Output(); err != nil {
+			c.ui.ErrorWithContext(err, "error rendering to file", ec.GetAll()...)
 		}
-		render.toTerminal(c)
 	}
 
 	return 0
@@ -337,4 +205,105 @@ func (c *RenderCommand) Help() string {
 // Synopsis satisfies the Synopsis function of the cli.Command interface.
 func (c *RenderCommand) Synopsis() string {
 	return "Render the templates within a pack"
+}
+
+type Render struct {
+	Name    string
+	Content string
+	c       *RenderCommand
+	ec      *errors.UIErrorContext
+}
+
+// Output is the primary method for emitting the rendered templates to their
+// destinations.
+func (r Render) Output() (err error, ec *errors.UIErrorContext) {
+	if r.c.renderToDir != "" {
+		err = r.toFile()
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return err, r.ec
+			}
+		}
+	}
+
+	r.toTerminal()
+	return nil, r.ec
+}
+
+func (r Render) toTerminal() {
+	r.c.ui.Output(r.Name+":", terminal.WithStyle(terminal.BoldStyle))
+	r.c.ui.Output("")
+	r.c.ui.Output(r.Content)
+}
+
+func (r Render) toFile() (err error) {
+	filePath, fileName := path.Split(r.Name)
+	outDir := path.Join(r.c.renderToDir, filePath)
+
+	filesystem.CreatePath(outDir, false)
+	outFile := path.Join(outDir, fileName)
+
+	overwrite, err := maybeConfirmOverwrite(outFile, r.c)
+	if err != nil {
+		// the caller should check to see if the error is a context.Canceled error
+		// which signals a keyboard interrupt in the confirmation loop.
+		return err
+	}
+	if !overwrite {
+		return fs.ErrExist
+	}
+	err = filesystem.WriteFile(outFile, r.Content, r.c.autoApproved || overwrite)
+	if err != nil {
+		r.ec.Add(errors.RenderContextDestFile, outFile)
+		return err
+	}
+
+	return nil
+}
+
+// confirmOverwrite prompts the user to confirm that they want to overwrite. If
+// the auto-approved flag is set, the function always returns true. If the
+// command is running non-interactively, it will return false. Otherwise, it will
+// loop on invalid input until the user chooses `y` or `n`.
+func maybeConfirmOverwrite(path string, c *RenderCommand) (bool, error) {
+	// if the flag is set, we don't need to prompt the user
+	if c.autoApproved {
+		return true, nil
+	}
+
+	// there's nothing to ask about if a file doesn't exist at the destination
+	if !filesystem.Exists(path, false) {
+		return true, nil
+	}
+	// if the ui is not interactive, we should return false.
+	if !c.ui.Interactive() {
+		return false, nil
+	}
+
+	// loop until we get a valid response
+	for {
+		overwrite, err := c.ui.Input(&terminal.Input{
+			Prompt: "Output file exists, overwrite? [y/n/a] ",
+			Style:  terminal.WarningBoldStyle,
+		})
+		if err != nil {
+			return false, err
+		}
+		overwrite = strings.ToLower(overwrite)
+		if overwrite == "y" || overwrite == "n" || overwrite == "a" {
+			if overwrite == "a" {
+				c.autoApproved = true
+			}
+			return overwrite == "y", nil
+		}
+	}
+}
+
+// formatRenderName trims the low-value elements from the rendered template
+// name.
+func formatRenderName(name string) string {
+	outName := strings.Replace(name, "/templates/", "/", 1)
+	outName = strings.TrimRight(outName, ".tpl")
+
+	return outName
 }
